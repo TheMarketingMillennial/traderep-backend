@@ -66,7 +66,10 @@ MOCK_MODE           = os.environ.get('MOCK_MODE', 'true').lower() != 'false'
 ACCOUNT_SID         = os.environ.get('TWILIO_ACCOUNT_SID', '')
 AUTH_TOKEN          = os.environ.get('TWILIO_AUTH_TOKEN', '')
 TWILIO_PHONE        = os.environ.get('TWILIO_PHONE_NUMBER', '')
-GOOGLE_REVIEW_LINK  = os.environ.get('GOOGLE_REVIEW_LINK', 'https://g.page/r/review')
+# NOTE: Google review links are NOT stored here.
+# Each company's link lives in their Firestore document (google_review_link field)
+# and is passed in the SMS body by the Flutter app. This server just sends
+# whatever body it receives — it has no knowledge of individual clients.
 
 # In-memory SMS log — persists for the lifetime of the Railway container
 # Wire to Firestore or Postgres for permanent persistence
@@ -174,7 +177,6 @@ class SmsHandler(BaseHTTPRequestHandler):
                 'mock_mode':          MOCK_MODE,
                 'twilio_configured':  bool(ACCOUNT_SID and AUTH_TOKEN and TWILIO_PHONE),
                 'messages_sent':      len(_sms_log),
-                'google_review_link': GOOGLE_REVIEW_LINK,
             })
 
         elif path == '/sms/log':
@@ -197,7 +199,6 @@ class SmsHandler(BaseHTTPRequestHandler):
                 'mock_mode':          MOCK_MODE,
                 'twilio_configured':  bool(ACCOUNT_SID and AUTH_TOKEN and TWILIO_PHONE),
                 'twilio_phone':       TWILIO_PHONE[-4:].rjust(len(TWILIO_PHONE), '*') if TWILIO_PHONE else '(not set)',
-                'google_review_link': GOOGLE_REVIEW_LINK,
             })
 
         else:
