@@ -1,0 +1,13 @@
+# TradeRep Pro — SMS Proxy Server Dependencies
+#
+# This server uses Python stdlib only in MOCK_MODE=true (default).
+# Uncomment twilio when you're ready to go live.
+#
+# Railway will install all uncommented packages automatically.
+
+# ── Optional: only needed when MOCK_MODE=false ──────────────────────────────
+# Uncomment the line below when you set MOCK_MODE=false in Railway Variables
+twilio>=8.0.0
+
+# ── No other dependencies required ──────────────────────────────────────────
+# http.server, json, os, uuid, logging, datetime — all Python stdlib
