@@ -347,30 +347,35 @@ app.post('/create-subscription', async (req, res) => {
     const purchasedSeats = includedSeats + extraSeatCount;
 
     if (db) {
-      const trialEnd = new Date(subscription.trial_end * 1000);
-      await db.collection('companies').doc(companyId).update({
+      const trialEndDate  = new Date(subscription.trial_end * 1000);
+      const trialStartDate = new Date(subscription.trial_start * 1000);
+      const trialEndTs    = admin.firestore.Timestamp.fromDate(trialEndDate);
+      const trialStartTs  = admin.firestore.Timestamp.fromDate(trialStartDate);
+
+      // Write to companies/{companyId}/subscription — single source of truth.
+      // Flutter subscriptionStream() watches this document and updates live.
+      // Both 'status' and 'subscription_status' are written for compatibility
+      // with the Flutter _parseStatus() reader.
+      await db.collection('companies').doc(companyId).set({
         subscription: {
           stripe_subscription_id: subscription.id,
           stripe_customer_id:     customerId,
           status:                 'trialing',
-          trial_start:            admin.firestore.Timestamp.fromDate(new Date(subscription.trial_start * 1000)),
-          trial_end:              admin.firestore.Timestamp.fromDate(trialEnd),
-          current_period_end:     admin.firestore.Timestamp.fromDate(new Date(subscription.current_period_end * 1000)),
+          subscription_status:    'trialing',
+          trial_start:            trialStartTs,
+          trial_end:              trialEndTs,
+          trial_start_date:       trialStartTs,
+          trial_end_date:         trialEndTs,
+          current_period_end:     admin.firestore.Timestamp.fromDate(
+            new Date(subscription.current_period_end * 1000)
+          ),
+          purchased_seats:        purchasedSeats,
+          extra_seats:            extraSeatCount,
           updated_at:             admin.firestore.FieldValue.serverTimestamp(),
         },
-      });
-
-      // Also write to saas_metrics for seat tracking
-      await db.collection('saas_metrics').doc('metrics_current').set({
-        subscription_status:     'trialing',
-        stripe_subscription_id:  subscription.id,
-        stripe_customer_id:      customerId,
-        purchased_seats:         purchasedSeats,
-        extra_seats:             extraSeatCount,
-        updated_at:              admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
 
-      console.log(`[Firestore] Subscription written — trial ends: ${trialEnd.toISOString()}, seats: ${purchasedSeats}`);
+      console.log(`[Firestore] Subscription written — trial ends: ${trialEndDate.toISOString()}, seats: ${purchasedSeats}`);
     }
 
     res.json({
@@ -544,23 +549,34 @@ app.post('/stripe-webhook', async (req, res) => {
           const includedSeats  = 3;
           const purchasedSeats = includedSeats + extraSeats;
 
-          // Update company subscription record
-          await db.collection('companies').doc(companyId).update({
-            'subscription.status':             sub.status,
-            'subscription.current_period_end': admin.firestore.Timestamp.fromDate(
+          // Build update — always include subscription_status (Flutter reads this field)
+          // and preserve trial_start_date / trial_end_date so they are never lost.
+          const subUpdate = {
+            'subscription.subscription_status': sub.status,
+            'subscription.status':              sub.status,
+            'subscription.current_period_end':  admin.firestore.Timestamp.fromDate(
               new Date(sub.current_period_end * 1000)
             ),
-            'subscription.updated_at': admin.firestore.FieldValue.serverTimestamp(),
-          });
+            'subscription.purchased_seats':     purchasedSeats,
+            'subscription.extra_seats':         extraSeats,
+            'subscription.updated_at':          admin.firestore.FieldValue.serverTimestamp(),
+          };
 
-          // Sync seat counts to saas_metrics
-          await db.collection('saas_metrics').doc('metrics_current').set({
-            subscription_status:    sub.status,
-            stripe_subscription_id: sub.id,
-            purchased_seats:        purchasedSeats,
-            extra_seats:            extraSeats,
-            updated_at:             admin.firestore.FieldValue.serverTimestamp(),
-          }, { merge: true });
+          // Write trial timestamps when present (preserves countdown across events)
+          if (sub.trial_start) {
+            subUpdate['subscription.trial_start_date'] = admin.firestore.Timestamp.fromDate(
+              new Date(sub.trial_start * 1000)
+            );
+            subUpdate['subscription.trial_start'] = subUpdate['subscription.trial_start_date'];
+          }
+          if (sub.trial_end) {
+            subUpdate['subscription.trial_end_date'] = admin.firestore.Timestamp.fromDate(
+              new Date(sub.trial_end * 1000)
+            );
+            subUpdate['subscription.trial_end'] = subUpdate['subscription.trial_end_date'];
+          }
+
+          await db.collection('companies').doc(companyId).update(subUpdate);
 
           console.log(`[Webhook] Subscription updated — company: ${companyId}, status: ${sub.status}, seats: ${purchasedSeats} (${extraSeats} extra)`);
         }
@@ -578,14 +594,15 @@ app.post('/stripe-webhook', async (req, res) => {
 
         if (companyId && db) {
           await db.collection('companies').doc(companyId).update({
-            'subscription.status':             'active',
-            'subscription.current_period_end': admin.firestore.Timestamp.fromDate(
+            'subscription.status':              'active',
+            'subscription.subscription_status': 'active',
+            'subscription.current_period_end':  admin.firestore.Timestamp.fromDate(
               new Date(sub.current_period_end * 1000)
             ),
-            'subscription.last_payment':       admin.firestore.FieldValue.serverTimestamp(),
-            'subscription.updated_at':         admin.firestore.FieldValue.serverTimestamp(),
+            'subscription.last_payment':        admin.firestore.FieldValue.serverTimestamp(),
+            'subscription.updated_at':          admin.firestore.FieldValue.serverTimestamp(),
           });
-          console.log(`[Webhook] Payment succeeded — company: ${companyId}`);
+          console.log(`[Webhook] Payment succeeded → active — company: ${companyId}`);
         }
         break;
       }
@@ -601,10 +618,11 @@ app.post('/stripe-webhook', async (req, res) => {
 
         if (companyId && db) {
           await db.collection('companies').doc(companyId).update({
-            'subscription.status':     'past_due',
-            'subscription.updated_at': admin.firestore.FieldValue.serverTimestamp(),
+            'subscription.status':              'past_due',
+            'subscription.subscription_status': 'past_due',
+            'subscription.updated_at':          admin.firestore.FieldValue.serverTimestamp(),
           });
-          console.log(`[Webhook] Payment failed — company: ${companyId}`);
+          console.log(`[Webhook] Payment failed → past_due — company: ${companyId}`);
         }
         break;
       }
@@ -615,8 +633,9 @@ app.post('/stripe-webhook', async (req, res) => {
         const companyId = sub.metadata?.companyId;
         if (companyId && db) {
           await db.collection('companies').doc(companyId).update({
-            'subscription.status':     'canceled',
-            'subscription.updated_at': admin.firestore.FieldValue.serverTimestamp(),
+            'subscription.status':              'canceled',
+            'subscription.subscription_status': 'canceled',
+            'subscription.updated_at':          admin.firestore.FieldValue.serverTimestamp(),
           });
           console.log(`[Webhook] Subscription cancelled — company: ${companyId}`);
         }
