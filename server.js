@@ -79,12 +79,16 @@ app.get('/health', (req, res) => {
 //
 // POST /generate-caption
 // Body: {
-//   companyName,    // "Smith Roofing"
-//   trade,          // "Roofing"
-//   serviceArea,    // "Austin, TX"
-//   jobType,        // "Roof Replacement"
-//   jobDescription, // optional crew note
-//   tone,           // "professional" | "friendly" | "bold"  (default: professional)
+//   companyName,          // "Smith Roofing"
+//   trade,                // "Roofing"
+//   serviceArea,          // "Austin, TX"
+//   jobType,              // "Roof Replacement"
+//   jobDescription,       // optional crew note (composed from work type + crew note)
+//   tone,                 // one of 9 brand voice keys (default: professional)
+//   customerHighlight,    // optional one-sentence customer highlight
+//   customerCity,         // optional city for geographic relevance
+//   season,               // optional "spring"|"summer"|"fall"|"winter"
+//   previousPosts,        // optional array of {opening, closing, hashtags} for anti-repetition
 // }
 // Returns: { caption, hashtags }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,66 +99,135 @@ app.post('/generate-caption', async (req, res) => {
 
   try {
     const {
-      companyName   = '',
-      trade         = 'contractor',
-      serviceArea   = '',
-      jobType       = 'project',
-      jobDescription = '',
-      tone          = 'professional',
+      companyName        = '',
+      trade              = 'contractor',
+      serviceArea        = '',
+      jobType            = 'project',
+      jobDescription     = '',
+      tone               = 'professional',
+      customerHighlight  = '',
+      customerCity       = '',
+      season             = '',
+      previousPosts      = [],
     } = req.body;
 
     if (!jobType) {
       return res.status(400).json({ error: 'jobType is required' });
     }
 
-    const areaStr = serviceArea ? ` in ${serviceArea}` : '';
-    const noteStr = jobDescription ? `\nCrew note: "${jobDescription}"` : '';
+    // Brand voice guidance — each has a distinct, opinionated style
     const toneGuide = {
-      professional: 'professional and trustworthy — highlight quality and reliability',
-      friendly:     'warm and conversational — like a neighbor recommending a trusted contractor',
-      bold:         'confident and punchy — short sentences, strong verbs, make them want to call',
+      professional:    'professional and trustworthy — highlight quality, reliability, and expertise. Use clear language that builds confidence.',
+      friendly:        'warm and conversational — write like a neighbor recommending a trusted contractor. Feel genuine and approachable.',
+      family_owned:    'personal and community-rooted — emphasize the family business angle, local roots, and personal investment in every job.',
+      luxury:          'premium and sophisticated — focus on craftsmanship, quality materials, and elevated results. Avoid casual language.',
+      educational:     'informative and helpful — briefly explain the work or why it matters. Teach the reader something useful without being preachy.',
+      straightforward: 'direct and no-nonsense — state what was done, why it matters, move on. Short sentences. No filler.',
+      premium:         'high-quality and exclusive — position the company as the best choice, not just a good one. Confident without being arrogant.',
+      bold:            'punchy and confident — short sentences, strong verbs, energy. Make them want to call right now.',
+      local_community: 'neighborly and place-based — weave the local community into the story. Feel like it was written by someone who lives there.',
     }[tone] || 'professional and trustworthy';
 
-    // Rotate opening styles so posts don't all sound the same
+    // Geographic context
+    const locationLine = customerCity
+      ? `Customer location: ${customerCity} (incorporate naturally — once, not repeatedly)`
+      : serviceArea ? `Service area: ${serviceArea}` : '';
+
+    // Context lines
+    const noteStr      = jobDescription     ? `Crew notes: "${jobDescription}"` : '';
+    const highlightStr = customerHighlight  ? `Customer highlight: "${customerHighlight}" — weave this in authentically` : '';
+    const seasonStr    = season             ? `Current season: ${season} — reference if relevant` : '';
+
+    // Anti-repetition block — inject up to 40 previous posts
+    let antiRepetitionBlock = '';
+    if (previousPosts && previousPosts.length > 0) {
+      const recent = previousPosts.slice(0, 40);
+      const prevOpenings = recent.map(p => p.opening).filter(Boolean).join('\n- ');
+      const prevClosings = recent.map(p => p.closing).filter(Boolean).join('\n- ');
+      const prevHashtags = [...new Set(
+        recent.flatMap(p => (p.hashtags || '').split(' ').filter(h => h.startsWith('#')))
+      )].join(' ');
+
+      antiRepetitionBlock = `
+ANTI-REPETITION RULES (CRITICAL):
+Previous post openings to NEVER repeat or closely imitate:
+- ${prevOpenings || 'none yet'}
+
+Previous post closings to NEVER repeat or closely imitate:
+- ${prevClosings || 'none yet'}
+
+Previously used hashtags (rotate — use no more than 2 of these):
+${prevHashtags || 'none yet'}
+
+Every post must feel like it was written fresh — different sentence structure, different opening, different CTA, different hashtags.`;
+    }
+
+    // Diverse opening strategies
     const openingStyles = [
-      'Start with a specific detail about the job or the result (e.g. "40-year-old shingles, gone.")',
-      'Start with a question the homeowner was probably asking before hiring (e.g. "Tired of that leaking roof?")',
-      'Start with the outcome/transformation (e.g. "Before: cracked tile floor. After: brand new luxury vinyl throughout.")',
-      'Start with a behind-the-scenes detail that shows craftsmanship',
-      'Start with a short punchy statement about the work or the crew',
+      'Start mid-story — drop the reader into the job as if they\'re already there.',
+      'Start with a specific before-condition that the homeowner dealt with (e.g. "The drain had been backing up for weeks.")',
+      'Start with the result — what does it look like now that the job is done?',
+      'Start with a question the homeowner was probably asking themselves.',
+      'Start with a specific, concrete detail about the craft or materials.',
+      'Start with a time element — "Last week," "Yesterday morning," "Three days ahead of schedule"',
+      'Start with the customer\'s situation, not the company\'s action.',
+      'Open with a trade-specific observation that shows expertise.',
     ];
     const openingStyle = openingStyles[Math.floor(Math.random() * openingStyles.length)];
 
-    const prompt = `You are writing a Google Business Profile post for a trade contractor.
+    // CTA variety pool
+    const ctaOptions = [
+      'End with: "Need something similar? Give us a call."',
+      'End with: "Planning a project? We\'d love to take a look."',
+      'End with: "Questions about your home? Reach out — no pressure."',
+      'End with: "Thinking about upgrading? Let\'s talk."',
+      'End with: "Ready when you are. Just give us a ring."',
+      'End with a simple invitation to connect — no hard sell.',
+      'End with something that references the local community or service area.',
+    ];
+    const ctaStyle = ctaOptions[Math.floor(Math.random() * ctaOptions.length)];
 
+    const prompt = `You are writing a Google Business Profile post for a trade contractor. Your goal is to produce content that sounds like it was written by a real business owner documenting real work — not by an AI following a template.
+
+COMPANY CONTEXT:
 Company: ${companyName || 'a local contractor'}
 Trade: ${trade}
-Location: ${serviceArea || 'local area'}
-Job completed: ${jobType}${noteStr}
-Tone: ${toneGuide}
-Opening style: ${openingStyle}
+${locationLine}
+Job completed: ${jobType}
+${noteStr}
+${highlightStr}
+${seasonStr}
 
-Write a Google Business Profile post following these rules:
-- 3–5 sentences max — no fluff
-- Follow the opening style instruction above
-- Mention the specific job type naturally
-- Include a call to action at the end (vary it — not always "Call us for a free estimate")
-- Do NOT use: "thrilled", "delighted", "excited", "proud", "we are pleased"
-- Do NOT start with "We just completed" or "We are happy to"
-- Sound like the contractor wrote it themselves — real, not corporate
-- Location mention is optional — only include if it fits naturally
-- Include 1–2 emojis placed naturally (not at the start)
+BRAND VOICE: ${toneGuide}
 
-Also generate 6 relevant hashtags (no spaces, each starting with #).
-Mix trade-specific tags with local/general ones.
+OPENING APPROACH: ${openingStyle}
+CALL TO ACTION: ${ctaStyle}
+${antiRepetitionBlock}
+
+CONTENT RULES:
+- Length: 120–250 words. No shorter, no longer.
+- Write conversationally. No corporate speak.
+- No clichés: "thrilled", "delighted", "excited", "proud to announce", "we are pleased"
+- No template openings: "We recently completed", "Another successful", "Our team just", "We are happy to"
+- Mention location at most once — only if it fits naturally
+- Use 1–2 emojis max, placed mid-sentence or end — never at the start
+- No exclamation marks unless the CTA genuinely calls for one
+- The post should feel like authentic local storytelling
+- Future image analysis hook (for internal use): <!-- image_context: none -->
+
+HASHTAGS:
+- Generate exactly 3–5 hashtags
+- Mix trade-specific, location-relevant, and general home improvement tags
+- Avoid generic: #Contractor #HomeImprovement (use more specific ones)
+- No hashtag should repeat a word from the previous posts list above
 
 Respond in this exact JSON format:
 {
   "caption": "the post text here",
-  "hashtags": ["#Tag1", "#Tag2", "#Tag3", "#Tag4", "#Tag5", "#Tag6"]
+  "hashtags": ["#Tag1", "#Tag2", "#Tag3", "#Tag4", "#Tag5"]
 }`;
 
-    console.log(`[OpenAI] Generating caption — trade: ${trade}, job: ${jobType}, tone: ${tone}`);
+    console.log(`[OpenAI] Generating caption — trade: ${trade}, job: ${jobType}, voice: ${tone}, prevPosts: ${previousPosts.length}`);
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',          // fast and cheap — ~$0.0002 per caption
