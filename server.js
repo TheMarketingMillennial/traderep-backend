@@ -192,37 +192,31 @@ Respond in this exact JSON format:
 // ─────────────────────────────────────────────────────────────────────────────
 // STRIPE — CREATE SUBSCRIPTION
 //
-// Called by the Flutter app when a user selects a plan.
-// 1. Creates or retrieves a Stripe Customer for this company
-// 2. Creates a Subscription with a 14-day trial
-// 3. Returns the PaymentIntent client_secret so the Flutter payment sheet
-//    can collect card details (card is stored but not charged until trial ends)
+// Called by the Flutter app when a user starts a TradeRep Pro trial.
+// Single plan only — no price key selection.
+//
+// Subscription items built as:
+//   - Always: 1× PRICE_IDS.starter ($75/mo base)
+//   - If extraSeats > 0: +N× PRICE_IDS.growth ($14.99/seat/mo)
 //
 // POST /create-subscription
-// Body: { companyId, email, fullName, priceKey }
-// priceKey: 'starter' | 'growth' | 'pro'
+// Body: { companyId, email, name, extraSeats? }
+// Returns: { subscriptionId, customerId, clientSecret, trialEnd, status }
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/create-subscription', async (req, res) => {
   try {
-    const { companyId, email, fullName, priceKey } = req.body;
+    const { companyId, email, name, extraSeats = 0 } = req.body;
 
-    if (!companyId || !email || !priceKey) {
-      return res.status(400).json({ error: 'companyId, email, and priceKey are required' });
+    if (!companyId || !email) {
+      return res.status(400).json({ error: 'companyId and email are required' });
     }
 
-    const priceId = PRICE_IDS[priceKey?.toLowerCase()];
-    if (!priceId) {
-      return res.status(400).json({
-        error: `Invalid priceKey: ${priceKey}. Must be starter, growth, or pro.`,
-      });
-    }
-
-    console.log(`[Stripe] create-subscription — company: ${companyId}, plan: ${priceKey}`);
+    const extraSeatCount = Math.max(0, parseInt(extraSeats, 10) || 0);
+    console.log(`[Stripe] create-subscription — company: ${companyId}, email: ${email}, extraSeats: ${extraSeatCount}`);
 
     // ── 1. Find or create Stripe Customer ─────────────────────────────────────
     let customerId = null;
 
-    // Check Firestore for existing customer ID
     if (db) {
       const companyDoc = await db.collection('companies').doc(companyId).get();
       if (companyDoc.exists) {
@@ -233,13 +227,12 @@ app.post('/create-subscription', async (req, res) => {
     if (!customerId) {
       const customer = await stripe.customers.create({
         email,
-        name: fullName || '',
+        name: name || '',
         metadata: { companyId },
       });
       customerId = customer.id;
       console.log(`[Stripe] Created customer: ${customerId}`);
 
-      // Save customer ID to Firestore immediately
       if (db) {
         await db.collection('companies').doc(companyId).update({
           stripe_customer_id: customerId,
@@ -249,15 +242,17 @@ app.post('/create-subscription', async (req, res) => {
       console.log(`[Stripe] Reusing customer: ${customerId}`);
     }
 
-    // ── 2. Create Subscription with 14-day trial ──────────────────────────────
-    // payment_behavior: 'default_incomplete' means the subscription is created
-    // but stays incomplete until the customer confirms their payment method.
-    // trial_period_days: 14 — no charge for 14 days.
-    // payment_settings.save_default_payment_method: 'on_subscription' — card
-    // is saved to the customer for automatic billing after trial.
+    // ── 2. Build subscription items ───────────────────────────────────────────
+    // Always include the base plan. Add seat price only if extra seats requested.
+    const items = [{ price: PRICE_IDS.starter }];
+    if (extraSeatCount > 0) {
+      items.push({ price: PRICE_IDS.growth, quantity: extraSeatCount });
+    }
+
+    // ── 3. Create Subscription with 14-day trial ──────────────────────────────
     const subscription = await stripe.subscriptions.create({
       customer: customerId,
-      items: [{ price: priceId }],
+      items,
       trial_period_days: 14,
       payment_behavior: 'default_incomplete',
       payment_settings: {
@@ -265,23 +260,25 @@ app.post('/create-subscription', async (req, res) => {
         payment_method_types: ['card'],
       },
       expand: ['latest_invoice.payment_intent'],
-      metadata: { companyId, priceKey },
+      metadata: { companyId, extraSeats: String(extraSeatCount) },
     });
 
-    console.log(`[Stripe] Subscription created: ${subscription.id} — status: ${subscription.status}`);
+    console.log(`[Stripe] Subscription created: ${subscription.id} — status: ${subscription.status}, items: ${items.length}`);
 
-    // ── 3. Extract client_secret for Flutter payment sheet ────────────────────
+    // ── 4. Extract client_secret for Flutter payment sheet ────────────────────
     const paymentIntent = subscription.latest_invoice?.payment_intent;
     const clientSecret  = paymentIntent?.client_secret || null;
 
-    // ── 4. Persist subscription to Firestore ──────────────────────────────────
+    // ── 5. Compute seat totals and persist to Firestore ───────────────────────
+    const includedSeats  = 3;
+    const purchasedSeats = includedSeats + extraSeatCount;
+
     if (db) {
       const trialEnd = new Date(subscription.trial_end * 1000);
       await db.collection('companies').doc(companyId).update({
         subscription: {
           stripe_subscription_id: subscription.id,
           stripe_customer_id:     customerId,
-          price_key:              priceKey,
           status:                 'trialing',
           trial_start:            admin.firestore.Timestamp.fromDate(new Date(subscription.trial_start * 1000)),
           trial_end:              admin.firestore.Timestamp.fromDate(trialEnd),
@@ -289,11 +286,23 @@ app.post('/create-subscription', async (req, res) => {
           updated_at:             admin.firestore.FieldValue.serverTimestamp(),
         },
       });
-      console.log(`[Firestore] Subscription written — trial ends: ${trialEnd.toISOString()}`);
+
+      // Also write to saas_metrics for seat tracking
+      await db.collection('saas_metrics').doc('metrics_current').set({
+        subscription_status:     'trialing',
+        stripe_subscription_id:  subscription.id,
+        stripe_customer_id:      customerId,
+        purchased_seats:         purchasedSeats,
+        extra_seats:             extraSeatCount,
+        updated_at:              admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      console.log(`[Firestore] Subscription written — trial ends: ${trialEnd.toISOString()}, seats: ${purchasedSeats}`);
     }
 
     res.json({
       subscriptionId: subscription.id,
+      customerId,
       clientSecret,
       trialEnd: subscription.trial_end,
       status: subscription.status,
@@ -301,6 +310,106 @@ app.post('/create-subscription', async (req, res) => {
 
   } catch (err) {
     console.error('[Stripe] create-subscription error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STRIPE — ADD SEAT
+//
+// Called when an admin invites a team member but all included seats are used.
+// Modifies the existing subscription IN-PLACE — never cancels or recreates.
+//
+// Logic:
+//   1. Retrieve existing subscription from Stripe
+//   2. Find the growth (per-seat) item if it exists, or add it fresh
+//   3. Increment its quantity by 1 via stripe.subscriptions.update()
+//   4. Write updated purchased_seats / extra_seats to Firestore saas_metrics
+//
+// POST /add-seat
+// Body: { subscriptionId, companyId }
+// Returns: { success, purchasedSeats, extraSeats, subscriptionId }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/add-seat', async (req, res) => {
+  try {
+    const { subscriptionId, companyId } = req.body;
+
+    if (!subscriptionId || !companyId) {
+      return res.status(400).json({ error: 'subscriptionId and companyId are required' });
+    }
+
+    console.log(`[Stripe] add-seat — company: ${companyId}, subscription: ${subscriptionId}`);
+
+    // ── 1. Retrieve the existing subscription ─────────────────────────────────
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+
+    if (!subscription || subscription.status === 'canceled') {
+      return res.status(400).json({ error: 'Subscription not found or already cancelled.' });
+    }
+
+    // ── 2. Find the per-seat (growth) item in the subscription ────────────────
+    const seatPriceId = PRICE_IDS.growth;
+    const existingSeatItem = subscription.items.data.find(
+      (item) => item.price.id === seatPriceId
+    );
+
+    let updatedSubscription;
+
+    if (existingSeatItem) {
+      // Increment the existing seat item quantity by 1
+      const newQuantity = existingSeatItem.quantity + 1;
+      console.log(`[Stripe] Incrementing seat item ${existingSeatItem.id} quantity: ${existingSeatItem.quantity} → ${newQuantity}`);
+
+      updatedSubscription = await stripe.subscriptions.update(subscriptionId, {
+        items: [{
+          id:       existingSeatItem.id,
+          quantity: newQuantity,
+        }],
+        proration_behavior: 'create_prorations',
+      });
+    } else {
+      // No seat item yet — add one with quantity 1
+      console.log(`[Stripe] Adding new seat item (quantity: 1) to subscription ${subscriptionId}`);
+
+      updatedSubscription = await stripe.subscriptions.update(subscriptionId, {
+        items: [{
+          price:    seatPriceId,
+          quantity: 1,
+        }],
+        proration_behavior: 'create_prorations',
+      });
+    }
+
+    // ── 3. Compute updated seat totals ────────────────────────────────────────
+    const includedSeats = 3;
+    const updatedSeatItem = updatedSubscription.items.data.find(
+      (item) => item.price.id === seatPriceId
+    );
+    const extraSeats     = updatedSeatItem ? updatedSeatItem.quantity : 0;
+    const purchasedSeats = includedSeats + extraSeats;
+
+    console.log(`[Stripe] Seat added — extra: ${extraSeats}, total: ${purchasedSeats}`);
+
+    // ── 4. Write updated seat counts to Firestore ─────────────────────────────
+    if (db) {
+      await db.collection('saas_metrics').doc('metrics_current').set({
+        purchased_seats: purchasedSeats,
+        extra_seats:     extraSeats,
+        updated_at:      admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      console.log(`[Firestore] Seat counts updated — purchased: ${purchasedSeats}, extra: ${extraSeats}`);
+    }
+
+    res.json({
+      success:        true,
+      subscriptionId: updatedSubscription.id,
+      purchasedSeats,
+      extraSeats,
+    });
+
+  } catch (err) {
+    console.error('[Stripe] add-seat error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -350,11 +459,19 @@ app.post('/stripe-webhook', async (req, res) => {
         break;
       }
 
-      // ── Subscription updated (trial → active, plan change, etc.) ─────────
+      // ── Subscription updated (trial → active, plan change, seat add, etc.) ──
       case 'customer.subscription.updated': {
         const sub       = event.data.object;
         const companyId = sub.metadata?.companyId;
         if (companyId && db) {
+          // Compute seat counts from subscription items
+          const seatPriceId    = PRICE_IDS.growth;
+          const seatItem       = sub.items?.data?.find((i) => i.price?.id === seatPriceId);
+          const extraSeats     = seatItem ? (seatItem.quantity || 0) : 0;
+          const includedSeats  = 3;
+          const purchasedSeats = includedSeats + extraSeats;
+
+          // Update company subscription record
           await db.collection('companies').doc(companyId).update({
             'subscription.status':             sub.status,
             'subscription.current_period_end': admin.firestore.Timestamp.fromDate(
@@ -362,7 +479,17 @@ app.post('/stripe-webhook', async (req, res) => {
             ),
             'subscription.updated_at': admin.firestore.FieldValue.serverTimestamp(),
           });
-          console.log(`[Webhook] Subscription updated — company: ${companyId}, status: ${sub.status}`);
+
+          // Sync seat counts to saas_metrics
+          await db.collection('saas_metrics').doc('metrics_current').set({
+            subscription_status:    sub.status,
+            stripe_subscription_id: sub.id,
+            purchased_seats:        purchasedSeats,
+            extra_seats:            extraSeats,
+            updated_at:             admin.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true });
+
+          console.log(`[Webhook] Subscription updated — company: ${companyId}, status: ${sub.status}, seats: ${purchasedSeats} (${extraSeats} extra)`);
         }
         break;
       }
